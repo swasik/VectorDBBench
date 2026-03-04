@@ -1,18 +1,19 @@
-"""Wrapper around the ScyllaDB vector database for VectorDB benchmarks."""
+"""Wrapper around the ScyllaDB vector database for VectorDB benchmarks.
+
+Uses the new ``scylla`` Python-rs driver (async, Rust-backed) instead of the
+legacy ``cassandra-driver`` / ``scylla-driver``.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, ClassVar, Final
 
-import cassandra
-from cassandra import ConsistencyLevel
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.cluster import Cluster, Session
-from cassandra.policies import AddressTranslator as _BaseAddressTranslator
-from cassandra.query import BatchStatement, BatchType, PreparedStatement
+from scylla.enums import Consistency
+from scylla.session_builder import SessionBuilder
 
 from vectordb_bench.backend.filter import Filter, FilterOp
 
@@ -21,6 +22,10 @@ from .config import ScyllaDBIndexScope
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Sequence
+
+    from scylla.session import Session
+    from scylla.statement import PreparedStatement
+
     from .config import ScyllaDBIndexConfig
 
 __all__ = ["ScyllaDB"]
@@ -30,28 +35,29 @@ log = logging.getLogger(__name__)
 _INDEX_POLL_INTERVAL_SEC: Final[float] = 1.0
 _INDEX_BUILD_TIMEOUT_SEC: Final[float] = 3600.0
 
+# Default CQL native transport port
+_DEFAULT_PORT: Final[int] = 9042
 
-class _ContactPointTranslator(_BaseAddressTranslator):
-    """Translate discovered node addresses back to a known contact point.
 
-    When ScyllaDB runs inside Docker the node may broadcast its internal
-    container IP (e.g. ``172.18.0.2``) which is unreachable from the host.
-    This translator maps any address that is *not* one of the original
-    contact points back to the first contact point, keeping the driver
-    connected to reachable addresses.
+def _run(coro):
+    """Run an async coroutine from synchronous code.
+
+    Tries to use the current running loop if available (and schedules via
+    a thread), otherwise falls back to ``asyncio.run()``.
     """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-    def __init__(self, contact_points: list[str]) -> None:
-        self._known = set(contact_points)
-        self._default = contact_points[0]
+    if loop is not None and loop.is_running():
+        # We're inside an existing event loop (e.g. Jupyter, Streamlit).
+        # Cannot call asyncio.run(); run in a new thread instead.
+        import concurrent.futures
 
-    def translate(self, addr: str) -> str:
-        if addr in self._known:
-            return addr
-        log.debug(
-            "Translating discovered address %s -> %s", addr, self._default
-        )
-        return self._default
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
 
 
 class ScyllaDB(VectorDB):
@@ -59,6 +65,9 @@ class ScyllaDB(VectorDB):
 
     Manages connection lifecycle, schema creation, data ingestion,
     and ANN search against a ScyllaDB cluster with vector-search support.
+
+    This implementation uses the new async Python-rs driver from
+    ``scylladb-zpp-2025-python-rs-driver/python-rs-driver``.
     """
 
     supported_filter_types: ClassVar[list[FilterOp]] = [
@@ -92,110 +101,94 @@ class ScyllaDB(VectorDB):
         self.vector_field = vector_field
         self.with_scalar_labels = with_scalar_labels
 
-        self.auth_provider: PlainTextAuthProvider | None = self._build_auth_provider()
-
-        # Mutable state — set by init() / prepare_filter()
-        self.cluster: Cluster | None = None
+        # Mutable state -- set by init() / prepare_filter()
         self.session: Session | None = None
         self.prepared_insert: PreparedStatement | None = None
         self.prepared_lookup: PreparedStatement | None = None
         self._filter_params: tuple[object, ...] = ()
 
         log.info(
-            "%s using %s version of %s driver.",
+            "%s using python-rs (Rust-backed) driver.",
             self.name,
-            cassandra.__version__,
-            self._get_driver_provider(),
         )
         log.info("%s index params: %s", self.name, self.case_config.index_param())
 
-        with self._connect() as session:
-            if drop_old:
-                log.info("%s dropping old table: %s", self.name, self.table_name)
-                session.execute(f"DROP TABLE IF EXISTS {self.table_name}")
-                self._create_table(session)
-                if not self.case_config.create_index_after_upload:
-                    self._create_index(session)
+        async def _setup():
+            session = await self._connect()
+            try:
+                if drop_old:
+                    log.info("%s dropping old table: %s", self.name, self.table_name)
+                    await session.execute(f"DROP TABLE IF EXISTS {self.table_name}")
+                    await self._create_table(session)
+                    if not self.case_config.create_index_after_upload:
+                        await self._create_index(session)
+            finally:
+                # The python-rs driver session has no explicit shutdown;
+                # just let it go out of scope.
+                pass
 
-    # -- authentication & driver detection -----------------------------------
+        _run(_setup())
+
+    # -- authentication helpers -----------------------------------------------
 
     @staticmethod
-    def _build_auth_provider(
-        env_path: str = ".env",
-    ) -> PlainTextAuthProvider | None:
-        """Build authentication provider from environment variables.
+    def _read_credentials(env_path: str = ".env") -> tuple[str | None, str | None]:
+        """Read ScyllaDB credentials from environment.
 
-        Reads ``SCYLLADB_USERNAME`` and ``SCYLLADB_PASSWORD`` from a local
-        ``.env`` file (if present).  Returns ``None`` when neither variable is
-        set, and logs a warning when only one of the two is provided.
-
-        Args:
-            env_path: Path to the ``.env`` file.  Defaults to ``".env"``.
+        Returns ``(username, password)``; either or both may be ``None``.
         """
-        import environs  # optional dependency — imported lazily
+        import environs  # optional dependency -- imported lazily
 
         env = environs.Env()
         env.read_env(path=env_path, recurse=False)
         username: str | None = env("SCYLLADB_USERNAME", default=None)
         password: str | None = env("SCYLLADB_PASSWORD", default=None)
 
-        if username and password:
-            return PlainTextAuthProvider(username, password)
-        if username or password:
+        if (username is None) != (password is None):
             log.warning(
                 "Only one of SCYLLADB_USERNAME / SCYLLADB_PASSWORD is set; "
                 "authentication may fail."
             )
-        return None
-
-    @staticmethod
-    def _get_driver_provider() -> str:
-        """Detect whether the ScyllaDB-optimized or standard Cassandra driver is in use."""
-        try:
-            from cassandra.tablets import Tablet  # noqa: F401
-        except ImportError:
-            return "Cassandra"
-        else:
-            return "ScyllaDB"
+        return username, password
 
     # -- connection helpers ---------------------------------------------------
 
-    def _build_cluster(self, contact_points: list[str]) -> Cluster:
-        """Create a :class:`Cluster` with address translation enabled."""
-        return Cluster(
-            contact_points,
-            auth_provider=self.auth_provider,
-            address_translator=_ContactPointTranslator(contact_points),
-        )
+    def _build_session_builder(self, contact_points: list[str]) -> SessionBuilder:
+        """Create a :class:`SessionBuilder` for the configured cluster."""
+        # The python-rs driver's SessionBuilder does not support auth yet.
+        # Credentials are read but only logged as a warning for now.
+        username, password = self._read_credentials()
+        if username and password:
+            log.warning(
+                "%s: python-rs driver does not yet support authentication; "
+                "credentials are ignored.",
+                self.name,
+            )
+        return SessionBuilder(contact_points, _DEFAULT_PORT)
 
-    @contextmanager
-    def _connect(self, keyspace: str | None = None) -> Generator[Session, None, None]:
-        """Open a short-lived cluster connection and guarantee shutdown.
+    async def _connect(self, keyspace: str | None = None) -> Session:
+        """Open a connection returning the async Session.
 
         If *keyspace* is ``None`` the configured keyspace is created (if
-        needed) and set on the returned session automatically.
+        needed) and selected on the session automatically.
         """
         uri = self.db_config["cluster_uris"]
         ks = keyspace or self.db_config["keyspace"]
 
-        cluster = self._build_cluster(uri)
+        builder = self._build_session_builder(uri)
         log.info("%s connecting to cluster at %s", self.name, uri)
-        session = cluster.connect()
-        log.info("%s shard awareness: %s", self.name, cluster.is_shard_aware())
+        session = await builder.connect()
 
-        try:
-            if keyspace is None:
-                self._create_keyspace(session, ks)
-            session.set_keyspace(ks)
-            yield session
-        finally:
-            cluster.shutdown()
+        if keyspace is None:
+            await self._create_keyspace(session, ks)
+        await session.execute(f"USE {ks}")
+        return session
 
     def _ensure_session(self) -> Session:
         """Return the active session or raise if ``init()`` was not called."""
         if self.session is None:
             msg = (
-                f"{self.name}: no active session — "
+                f"{self.name}: no active session -- "
                 "wrap operations inside `with self.init():`"
             )
             raise RuntimeError(msg)
@@ -211,20 +204,20 @@ class ScyllaDB(VectorDB):
             and self.case_config.index_scope == ScyllaDBIndexScope.LOCAL
         )
 
-    def _create_keyspace(self, session: Session, keyspace: str) -> None:
+    async def _create_keyspace(self, session: Session, keyspace: str) -> None:
         """Create keyspace if it does not exist."""
         log.info("%s creating keyspace: %s", self.name, keyspace)
         replication_factor = self.db_config.get("replication_factor", 1)
         # Tablets require NetworkTopologyStrategy; SimpleStrategy is not supported.
         strategy = "NetworkTopologyStrategy"
-        session.execute(
+        await session.execute(
             f"CREATE KEYSPACE IF NOT EXISTS {keyspace} "
             f"WITH replication = {{'class': '{strategy}', "
             f"'replication_factor': '{replication_factor}'}} "
             f"AND tablets = {{'enabled': 'true'}}"
         )
 
-    def _create_table(self, session: Session) -> None:
+    async def _create_table(self, session: Session) -> None:
         """Create table for vector storage."""
         if self._use_local_index:
             pk = f"PRIMARY KEY ({self.label_col_name}, {self.id_col_name})"
@@ -245,10 +238,10 @@ class ScyllaDB(VectorDB):
             f"  {pk}"
             f")"
         )
-        session.execute(create_table_cql)
+        await session.execute(create_table_cql)
         log.info("%s created table: %s", self.name, self.table_name)
 
-    def _create_index(self, session: Session) -> None:
+    async def _create_index(self, session: Session) -> None:
         """Create vector search index on the table."""
         if self._use_local_index:
             target = f"(({self.label_col_name}), {self.vector_field})"
@@ -259,7 +252,7 @@ class ScyllaDB(VectorDB):
             f"{target} USING 'vector_index' "
             f"WITH OPTIONS = {self.case_config.index_param()}"
         )
-        session.execute(create_index_cql)
+        await session.execute(create_index_cql)
         log.info("%s created index on: %s", self.name, self.table_name)
 
     # -- lifecycle (per-process) ---------------------------------------------
@@ -275,11 +268,16 @@ class ScyllaDB(VectorDB):
                 db.insert_embeddings(...)
                 db.search_embedding(...)
         """
-        uri = self.db_config["cluster_uris"]
-        keyspace = self.db_config["keyspace"]
-        self.cluster = self._build_cluster(uri)
-        self.session = self.cluster.connect(keyspace)
 
+        async def _open():
+            uri = self.db_config["cluster_uris"]
+            keyspace = self.db_config["keyspace"]
+            builder = self._build_session_builder(uri)
+            session = await builder.connect()
+            await session.execute(f"USE {keyspace}")
+            return session
+
+        self.session = _run(_open())
         self._prepare_insert_statement()
 
         try:
@@ -288,10 +286,8 @@ class ScyllaDB(VectorDB):
             self._reset_session_state()
 
     def _reset_session_state(self) -> None:
-        """Shut down the cluster and clear all per-session state."""
-        if self.cluster is not None:
-            self.cluster.shutdown()
-        self.cluster = None
+        """Clear all per-session state."""
+        # The python-rs driver session has no explicit shutdown.
         self.session = None
         self.prepared_insert = None
         self.prepared_lookup = None
@@ -308,9 +304,13 @@ class ScyllaDB(VectorDB):
             columns = f"{self.id_col_name}, {self.vector_field}"
             placeholders = "?, ?"
 
-        self.prepared_insert = session.prepare(
-            f"INSERT INTO {self.table_name} ({columns}) VALUES ({placeholders})"
+        prepared = _run(
+            session.prepare(
+                f"INSERT INTO {self.table_name} ({columns}) VALUES ({placeholders})"
+            )
         )
+        # Set consistency ONE on the prepared statement
+        self.prepared_insert = prepared.with_consistency(Consistency.One)
 
     # -- data operations -----------------------------------------------------
 
@@ -325,7 +325,10 @@ class ScyllaDB(VectorDB):
         labels_data: Sequence[str] | None = None,
         **kwargs,
     ) -> tuple[int, Exception | None]:
-        """Insert embeddings into ScyllaDB.
+        """Insert embeddings into ScyllaDB using asyncio.gather for concurrency.
+
+        Instead of batch statements, each row is inserted as a separate
+        async execute call, gathered concurrently via ``asyncio.gather``.
 
         Args:
             embeddings: Vectors to insert.
@@ -339,23 +342,23 @@ class ScyllaDB(VectorDB):
         assert self.prepared_insert is not None, "prepared_insert not initialized"
 
         try:
-            batch = BatchStatement(
-                consistency_level=ConsistencyLevel.ONE,
-                batch_type=BatchType.UNLOGGED,
-            )
             if self.with_scalar_labels:
                 if labels_data is None:
                     raise ValueError(
                         "labels_data is required when with_scalar_labels is True"
                     )
-                for key, embedding, label in zip(
-                    metadata, embeddings, labels_data, strict=True
-                ):
-                    batch.add(self.prepared_insert, (key, embedding, label))
+                coroutines = [
+                    session.execute(self.prepared_insert, [key, embedding, label])
+                    for key, embedding, label in zip(
+                        metadata, embeddings, labels_data, strict=True
+                    )
+                ]
             else:
-                for key, embedding in zip(metadata, embeddings, strict=True):
-                    batch.add(self.prepared_insert, (key, embedding))
-            session.execute(batch)
+                coroutines = [
+                    session.execute(self.prepared_insert, [key, embedding])
+                    for key, embedding in zip(metadata, embeddings, strict=True)
+                ]
+            _run(asyncio.gather(*coroutines))
         except Exception as e:
             log.warning("%s failed to insert data: %s", self.name, e)
             return 0, e
@@ -387,12 +390,15 @@ class ScyllaDB(VectorDB):
             msg = f"Unsupported filter for {self.name}: {filters}"
             raise ValueError(msg)
 
-        self.prepared_lookup = session.prepare(
-            f"SELECT {self.id_col_name} FROM {self.table_name}"
-            f"{where} "
-            f"ORDER BY {self.vector_field} ANN OF ? LIMIT ?"
-            f"{allow_filtering}"
+        prepared = _run(
+            session.prepare(
+                f"SELECT {self.id_col_name} FROM {self.table_name}"
+                f"{where} "
+                f"ORDER BY {self.vector_field} ANN OF ? LIMIT ?"
+                f"{allow_filtering}"
+            )
         )
+        self.prepared_lookup = prepared
 
     def search_embedding(
         self,
@@ -415,14 +421,18 @@ class ScyllaDB(VectorDB):
         session = self._ensure_session()
         if self.prepared_lookup is None:
             msg = (
-                f"{self.name}: prepared_lookup is not set — "
+                f"{self.name}: prepared_lookup is not set -- "
                 "call prepare_filter() before searching"
             )
             raise RuntimeError(msg)
-        rows = session.execute(
-            self.prepared_lookup, (*self._filter_params, query, k)
+
+        result = _run(
+            session.execute(
+                self.prepared_lookup,
+                list(self._filter_params) + [query, k],
+            )
         )
-        return [row[0] for row in rows] if rows else []
+        return [row[self.id_col_name] for row in result.iter_rows()] if result else []
 
     # -- optimisation --------------------------------------------------------
 
@@ -438,18 +448,18 @@ class ScyllaDB(VectorDB):
             poll_interval: Seconds between successive probe queries.
         """
         session = self._ensure_session()
-        log.info("%s waiting for index build to complete …", self.name)
+        log.info("%s waiting for index build to complete ...", self.name)
 
         sample_vector = [0.0] * self.dim
         probe_cql = (
             f"SELECT * FROM {self.table_name} "
-            f"ORDER BY {self.vector_field} ANN OF %s LIMIT 1"
+            f"ORDER BY {self.vector_field} ANN OF ? LIMIT 1"
         )
 
         deadline = time.monotonic() + timeout
         while True:
             try:
-                session.execute(probe_cql, (sample_vector,))
+                _run(session.execute(probe_cql, [sample_vector]))
             except Exception as e:
                 if time.monotonic() >= deadline:
                     msg = f"{self.name}: index not ready after {timeout}s"
@@ -464,5 +474,5 @@ class ScyllaDB(VectorDB):
         """Create index (if deferred) and wait for it to be fully built before search benchmarks."""
         if self.case_config.create_index_after_upload:
             session = self._ensure_session()
-            self._create_index(session)
+            _run(self._create_index(session))
         self._wait_for_index_build()
