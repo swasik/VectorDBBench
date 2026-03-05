@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, ClassVar, Final
 
 from scylla.enums import Consistency
+from scylla.execution_profile import ExecutionProfile
 from scylla.session_builder import SessionBuilder
 
 from vectordb_bench.backend.filter import Filter, FilterOp
@@ -52,7 +54,16 @@ def _run(coro):
 
     if loop is not None and loop.is_running():
         # We're inside an existing event loop (e.g. Jupyter, Streamlit).
-        # Cannot call asyncio.run(); run in a new thread instead.
+        # Cannot call asyncio.run() because it would try to create a new
+        # event loop on this thread, which is forbidden while one is already
+        # running.  Instead, spawn a *single* worker thread that has no
+        # running loop and call asyncio.run(coro) there.
+        #
+        # max_workers=1 is intentional: we only ever submit one task, so the
+        # pool exists solely to escape the current thread's event loop.  All
+        # real concurrency (e.g. asyncio.gather inside the coroutine) happens
+        # within the fresh event loop that asyncio.run() creates on that
+        # single thread.
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -106,6 +117,11 @@ class ScyllaDB(VectorDB):
         self.prepared_insert: PreparedStatement | None = None
         self.prepared_lookup: PreparedStatement | None = None
         self._filter_params: tuple[object, ...] = ()
+
+        # Persistent event loop for the init() context – avoids the cost
+        # of creating / tearing down a loop on every _run() call.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
 
         log.info(
             "%s using python-rs (Rust-backed) driver.",
@@ -164,7 +180,10 @@ class ScyllaDB(VectorDB):
                 "credentials are ignored.",
                 self.name,
             )
-        return SessionBuilder(contact_points, _DEFAULT_PORT)
+        # Default to Consistency.One for all statements – sufficient for
+        # benchmarking and avoids the latency of LocalQuorum.
+        profile = ExecutionProfile(consistency=Consistency.One)
+        return SessionBuilder(contact_points, _DEFAULT_PORT, execution_profile=profile)
 
     async def _connect(self, keyspace: str | None = None) -> Session:
         """Open a connection returning the async Session.
@@ -257,6 +276,39 @@ class ScyllaDB(VectorDB):
 
     # -- lifecycle (per-process) ---------------------------------------------
 
+    # -- persistent event loop helpers ----------------------------------------
+
+    def _start_loop(self) -> None:
+        """Spin up a background thread running a persistent event loop.
+
+        All async driver calls within an ``init()`` context are dispatched
+        to this loop via :pymethod:`_run_async`, avoiding the overhead of
+        ``asyncio.run()`` (which creates *and* destroys a loop each time).
+        """
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="scylladb-event-loop",
+        )
+        self._loop_thread.start()
+
+    def _stop_loop(self) -> None:
+        """Shut down the persistent event loop and its thread."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=10.0)
+        self._loop = None
+        self._loop_thread = None
+
+    def _run_async(self, coro):
+        """Schedule *coro* on the persistent loop, or fall back to ``_run``."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+        return _run(coro)
+
     @contextmanager
     def init(self) -> Generator[None, None, None]:
         """Create and destroy connections to the database.
@@ -268,6 +320,7 @@ class ScyllaDB(VectorDB):
                 db.insert_embeddings(...)
                 db.search_embedding(...)
         """
+        self._start_loop()
 
         async def _open():
             uri = self.db_config["cluster_uris"]
@@ -277,7 +330,7 @@ class ScyllaDB(VectorDB):
             await session.execute(f"USE {keyspace}")
             return session
 
-        self.session = _run(_open())
+        self.session = self._run_async(_open())
         self._prepare_insert_statement()
 
         try:
@@ -292,6 +345,7 @@ class ScyllaDB(VectorDB):
         self.prepared_insert = None
         self.prepared_lookup = None
         self._filter_params = ()
+        self._stop_loop()
 
     def _prepare_insert_statement(self) -> None:
         """Prepare the CQL INSERT statement for the current session."""
@@ -304,7 +358,7 @@ class ScyllaDB(VectorDB):
             columns = f"{self.id_col_name}, {self.vector_field}"
             placeholders = "?, ?"
 
-        prepared = _run(
+        prepared = self._run_async(
             session.prepare(
                 f"INSERT INTO {self.table_name} ({columns}) VALUES ({placeholders})"
             )
@@ -361,7 +415,7 @@ class ScyllaDB(VectorDB):
             await asyncio.gather(*coros)
 
         try:
-            _run(_insert_batch())
+            self._run_async(_insert_batch())
         except Exception as e:
             log.warning("%s failed to insert data: %s", self.name, e)
             return 0, e
@@ -393,7 +447,7 @@ class ScyllaDB(VectorDB):
             msg = f"Unsupported filter for {self.name}: {filters}"
             raise ValueError(msg)
 
-        prepared = _run(
+        prepared = self._run_async(
             session.prepare(
                 f"SELECT {self.id_col_name} FROM {self.table_name}"
                 f"{where} "
@@ -401,7 +455,7 @@ class ScyllaDB(VectorDB):
                 f"{allow_filtering}"
             )
         )
-        self.prepared_lookup = prepared
+        self.prepared_lookup = prepared.with_consistency(Consistency.One)
 
     def search_embedding(
         self,
@@ -429,7 +483,7 @@ class ScyllaDB(VectorDB):
             )
             raise RuntimeError(msg)
 
-        result = _run(
+        result = self._run_async(
             session.execute(
                 self.prepared_lookup,
                 list(self._filter_params) + [query, k],
@@ -458,11 +512,13 @@ class ScyllaDB(VectorDB):
             f"SELECT * FROM {self.table_name} "
             f"ORDER BY {self.vector_field} ANN OF ? LIMIT 1"
         )
+        # Prepare once to avoid repeated server-side parsing in the poll loop.
+        prepared_probe = self._run_async(session.prepare(probe_cql))
 
         deadline = time.monotonic() + timeout
         while True:
             try:
-                _run(session.execute(probe_cql, [sample_vector]))
+                self._run_async(session.execute(prepared_probe, [sample_vector]))
             except Exception as e:
                 if time.monotonic() >= deadline:
                     msg = f"{self.name}: index not ready after {timeout}s"
@@ -477,5 +533,5 @@ class ScyllaDB(VectorDB):
         """Create index (if deferred) and wait for it to be fully built before search benchmarks."""
         if self.case_config.create_index_after_upload:
             session = self._ensure_session()
-            _run(self._create_index(session))
+            self._run_async(self._create_index(session))
         self._wait_for_index_build()
