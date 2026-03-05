@@ -75,7 +75,7 @@ all = [
     "pyvespa",
     "lancedb",
     "mysql-connector-python",
-    "scylla @ git+https://github.com/scylladb-zpp-2025-python-rs-driver/python-rs-driver.git",
+    "scylla @ git+https://github.com/Lorak-mmk/python-rs-driver.git@avoid-tokio-spawn",
 ]
 
 qdrant          = [ "qdrant-client" ]
@@ -100,7 +100,7 @@ clickhouse      = [ "clickhouse-connect" ]
 vespa           = [ "pyvespa" ]
 lancedb         = [ "lancedb" ]
 oceanbase       = [ "mysql-connector-python" ]
-scylladb        = [ "scylla @ git+https://github.com/scylladb-zpp-2025-python-rs-driver/python-rs-driver.git" ]
+scylladb        = [ "scylla @ git+https://github.com/Lorak-mmk/python-rs-driver.git@avoid-tokio-spawn" ]
 
 [project.urls]
 "repository" = "https://github.com/zilliztech/VectorDBBench"

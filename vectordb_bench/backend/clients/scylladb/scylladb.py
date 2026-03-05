@@ -78,7 +78,7 @@ class ScyllaDB(VectorDB):
     and ANN search against a ScyllaDB cluster with vector-search support.
 
     This implementation uses the new async Python-rs driver from
-    ``scylladb-zpp-2025-python-rs-driver/python-rs-driver``.
+    ``Lorak-mmk/python-rs-driver`` (avoid-tokio-spawn branch).
     """
 
     supported_filter_types: ClassVar[list[FilterOp]] = [
