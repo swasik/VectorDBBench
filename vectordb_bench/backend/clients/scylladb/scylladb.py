@@ -341,24 +341,27 @@ class ScyllaDB(VectorDB):
         session = self._ensure_session()
         assert self.prepared_insert is not None, "prepared_insert not initialized"
 
-        try:
+        async def _insert_batch():
             if self.with_scalar_labels:
                 if labels_data is None:
                     raise ValueError(
                         "labels_data is required when with_scalar_labels is True"
                     )
-                coroutines = [
+                coros = [
                     session.execute(self.prepared_insert, [key, embedding, label])
                     for key, embedding, label in zip(
                         metadata, embeddings, labels_data, strict=True
                     )
                 ]
             else:
-                coroutines = [
+                coros = [
                     session.execute(self.prepared_insert, [key, embedding])
                     for key, embedding in zip(metadata, embeddings, strict=True)
                 ]
-            _run(asyncio.gather(*coroutines))
+            await asyncio.gather(*coros)
+
+        try:
+            _run(_insert_batch())
         except Exception as e:
             log.warning("%s failed to insert data: %s", self.name, e)
             return 0, e

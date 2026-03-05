@@ -217,40 +217,6 @@ class TestScyllaDBInit:
             db._ensure_session()
 
 
-def _make_sync_run():
-    """Create an event loop + a ``_run`` replacement that uses it.
-
-    Returns ``(loop, patched_run)``.  The caller must close the loop and unset
-    it when done (use :func:`_insert_test_context`).
-
-    ``asyncio.gather()`` called outside an async context (Python 3.13) uses
-    ``get_event_loop()``; by setting our own loop we ensure the returned Future
-    belongs to the same loop that ``run_until_complete`` later uses.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    def _patched_run(coro_or_future):
-        return loop.run_until_complete(coro_or_future)
-
-    return loop, _patched_run
-
-
-from contextlib import contextmanager
-
-
-@contextmanager
-def _insert_test_context():
-    """Context manager that provides a patched ``_run`` for insert tests."""
-    loop, patched_run = _make_sync_run()
-    try:
-        with patch.object(_scylladb_module, "_run", side_effect=patched_run):
-            yield
-    finally:
-        asyncio.set_event_loop(None)
-        loop.close()
-
-
 class TestScyllaDBInsertEmbeddings:
     """Tests for insert_embeddings() — verifies asyncio.gather pattern."""
 
@@ -274,8 +240,7 @@ class TestScyllaDBInsertEmbeddings:
         embeddings = [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]
         metadata = [1, 2]
 
-        with _insert_test_context():
-            count, err = db.insert_embeddings(embeddings, metadata)
+        count, err = db.insert_embeddings(embeddings, metadata)
 
         assert count == 2
         assert err is None
@@ -290,8 +255,7 @@ class TestScyllaDBInsertEmbeddings:
         metadata = [42]
         labels = ["red"]
 
-        with _insert_test_context():
-            count, err = db.insert_embeddings(embeddings, metadata, labels_data=labels)
+        count, err = db.insert_embeddings(embeddings, metadata, labels_data=labels)
 
         assert count == 1
         assert err is None
@@ -314,8 +278,7 @@ class TestScyllaDBInsertEmbeddings:
         db, session, prep = self._setup_db_with_session()
         session.execute = AsyncMock(side_effect=RuntimeError("connection lost"))
 
-        with _insert_test_context():
-            count, err = db.insert_embeddings([[0.1, 0.2, 0.3, 0.4]], [1])
+        count, err = db.insert_embeddings([[0.1, 0.2, 0.3, 0.4]], [1])
 
         assert count == 0
         assert isinstance(err, Exception)
