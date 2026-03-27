@@ -463,42 +463,12 @@ class ScyllaDB(VectorDB):
 
     # -- search & filtering --------------------------------------------------
 
-    def _ensure_index(self) -> None:
-        """Create the vector index if it does not already exist.
-
-        Called lazily from :meth:`prepare_filter` so that streaming
-        (read-while-write) tests can issue ANN queries even when
-        ``create_index_after_upload`` has deferred index creation past
-        the initial table setup.  The ``IF NOT EXISTS`` clause makes
-        this safe to call multiple times.
-
-        Unlike :meth:`_create_index` this intentionally does not log at
-        INFO level because it is called once per worker process (could be
-        dozens).
-        """
-        if getattr(self, "_index_ensured", False):
-            return
-        session = self._ensure_session()
-        if self._use_local_index:
-            target = f"(({self.label_col_name}), {self.vector_field})"
-        else:
-            target = f"({self.vector_field})"
-        cql = (
-            f"CREATE CUSTOM INDEX IF NOT EXISTS ON {self.table_name} "
-            f"{target} USING 'vector_index' "
-            f"WITH OPTIONS = {self.case_config.index_param()}"
-        )
-        self._run_async(session.execute(cql))
-        log.debug("%s _ensure_index completed for: %s", self.name, self.table_name)
-        self._index_ensured = True
-
     def prepare_filter(self, filters: Filter) -> None:
         """Pre-prepare filter conditions to reduce redundancy during search.
 
         Filter values are bound via CQL prepared-statement parameters
         rather than interpolated into the query string.
         """
-        self._ensure_index()
         session = self._ensure_session()
 
         if filters.type == FilterOp.NonFilter:
